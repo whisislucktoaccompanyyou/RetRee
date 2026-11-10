@@ -70,6 +70,17 @@ class Diffusion:
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
 
+def pad_to_square(image, fill=0):
+    """Pad the short side with black. Resize() alone stretches a non-square fundus into an ellipse."""
+    width, height = image.size
+    side = max(width, height)
+    if width == height:
+        return image
+    canvas = Image.new(image.mode, (side, side), fill)
+    canvas.paste(image, ((side - width) // 2, (side - height) // 2))
+    return canvas
+
+
 def pair_id(name):
     match = re.match(r"(\d+)", os.path.basename(name))
     if match is None:
@@ -150,6 +161,8 @@ class PairedDrive(Dataset):
         if fov_path is not None:
             fov = Image.open(fov_path).convert("L").resize(image.size, Image.NEAREST)
             image = Image.composite(image, Image.new("RGB", image.size), fov)
+        image = pad_to_square(image, 0)
+        vessel = pad_to_square(vessel, 0)
 
         image = self.image_tf(image)
         vessel = self.mask_tf(vessel)

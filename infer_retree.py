@@ -16,7 +16,7 @@ from PIL import Image
 from torchvision import transforms
 
 from DDPM_model import DDPM
-from run_retree import Diffusion
+from run_retree import Diffusion, pad_to_square
 
 
 def pair_id(name):
@@ -46,7 +46,7 @@ def collect_pairs(folder):
 
 
 def load_mask(path, img_size):
-    mask = Image.open(path).convert("L")
+    mask = pad_to_square(Image.open(path).convert("L"), 0)
     return transforms.Compose([
         transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.NEAREST),
         transforms.ToTensor(),
@@ -75,8 +75,8 @@ def generate(model, diffusion, mask, steps):
 
 
 def side_by_side(original_path, mask_path, generated, img_size):
-    original = Image.open(original_path).convert("RGB").resize((img_size, img_size), Image.BICUBIC)
-    mask = Image.open(mask_path).convert("RGB").resize((img_size, img_size), Image.NEAREST)
+    original = pad_to_square(Image.open(original_path).convert("RGB"), 0).resize((img_size, img_size), Image.BICUBIC)
+    mask = pad_to_square(Image.open(mask_path).convert("RGB"), 0).resize((img_size, img_size), Image.NEAREST)
     fake = Image.fromarray(generated.permute(1, 2, 0).cpu().numpy())
     strip = Image.new("RGB", (img_size * 3, img_size))
     strip.paste(original, (0, 0))

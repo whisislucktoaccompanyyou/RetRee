@@ -26,7 +26,7 @@ from torchvision import transforms
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
-from run_retree import Diffusion, collect_drive, save_checkpoint
+from run_retree import Diffusion, collect_drive, pad_to_square, save_checkpoint
 
 
 class Segmenter(nn.Module):
@@ -87,6 +87,8 @@ class DriveSeg(Dataset):
         if fov_path is not None:
             fov = Image.open(fov_path).convert("L").resize(image.size, Image.NEAREST)
             image = Image.composite(image, Image.new("RGB", image.size), fov)
+        image = pad_to_square(image, 0)
+        vessel = pad_to_square(vessel, 0)
         image = self.image_tf(image)
         vessel = (self.mask_tf(vessel) > 0.5).float()
         if self.augment:
@@ -100,22 +102,64 @@ class DriveSeg(Dataset):
         return image, vessel
 
 
-def good_eyeq(csv_path, min_quality):
+def good_eyeq(csv_path):
+    """EyeQ quality is a grade, not a score: 0 Good, 1 Usable, 2 Reject. Higher is worse."""
+    counts = {}
     keep = set()
     with open(csv_path, newline="") as handle:
         for row in csv.DictReader(handle):
-            if int(row["quality"]) >= min_quality:
+            grade = int(row["quality"])
+            counts[grade] = counts.get(grade, 0) + 1
+            if grade == 0:
                 keep.add(row["image"])
+    print(
+        "EyeQ grades: "
+        f"Good(0)={counts.get(0, 0)} "
+        f"Usable(1)={counts.get(1, 0)} "
+        f"Reject(2)={counts.get(2, 0)}; "
+        f"keeping Good only, {len(keep)} names"
+    )
     return keep
 
 
+def collect_stare(image_dir, label_dir):
+    """Pair STARE images with Hoover's .ah vessel maps. Both are 700x605 PPM."""
+    labels = {}
+    if not os.path.isdir(label_dir):
+        raise FileNotFoundError(f"STARE labels not found: {label_dir}")
+    for name in os.listdir(label_dir):
+        if not name.endswith(".ah.ppm"):
+            continue
+        labels[name[: -len(".ah.ppm")]] = os.path.join(label_dir, name)
+    pairs = []
+    missing = []
+    for key in sorted(labels):
+        image = os.path.join(image_dir, key + ".ppm")
+        if os.path.isfile(image):
+            pairs.append((image, labels[key], None))
+        else:
+            missing.append(key)
+    if missing:
+        raise FileNotFoundError(f"STARE labels without an image: {missing}")
+    if not pairs:
+        raise FileNotFoundError(f"no .ah.ppm labels in {label_dir}")
+    return pairs
+
+
 def train_segmenter(args, device):
-    pairs = collect_drive(args.drive, "training")
-    # DRIVE test ships no vessel labels, so the held-out score comes from the
-    # tail of the 20 labelled training images.
-    split_at = max(len(pairs) - 4, 1)
-    train_pairs, test_pairs = pairs[:split_at], pairs[split_at:]
-    print(f"segmenter: {len(train_pairs)} train, {len(test_pairs)} held-out")
+    drive_pairs = collect_drive(args.drive, "training")
+    stare_pairs = collect_stare(args.stare, args.stare_labels)
+    # DRIVE test ships no vessel labels. Hold out the tail of each labelled set
+    # so the score is not only the dataset the model just trained on.
+    drive_at = max(len(drive_pairs) - 4, 1)
+    stare_at = max(len(stare_pairs) - 4, 1)
+    train_pairs = drive_pairs[:drive_at] + stare_pairs[:stare_at]
+    test_pairs = drive_pairs[drive_at:] + stare_pairs[stare_at:]
+    print(
+        f"segmenter: DRIVE {drive_at}/{len(drive_pairs) - drive_at}, "
+        f"STARE {stare_at}/{len(stare_pairs) - stare_at}, "
+        f"total {len(train_pairs)} train, {len(test_pairs)} held-out"
+    )
 
     train_loader = DataLoader(
         DriveSeg(train_pairs, args.image_size, augment=True),
@@ -171,10 +215,10 @@ def evaluate_segmenter(model, loader, device):
 
 @torch.no_grad()
 def write_pseudo_labels(model, args, device):
-    keep = good_eyeq(args.quality_csv, args.min_quality)
+    keep = good_eyeq(args.quality_csv)
     names = sorted(name for name in os.listdir(args.kaggle) if name in keep)
     if not names:
-        raise FileNotFoundError(f"no quality>={args.min_quality} images in {args.kaggle}")
+        raise FileNotFoundError(f"no EyeQ Good (quality=0) images in {args.kaggle}")
     names = names[: args.max_images]
     print(f"pseudo labels: {len(names)} images")
 
@@ -190,7 +234,8 @@ def write_pseudo_labels(model, args, device):
     for start in tqdm(range(0, len(names), args.batch_size), desc="segment kaggle"):
         batch = names[start:start + args.batch_size]
         images = torch.stack([
-            to_tensor(Image.open(os.path.join(args.kaggle, name)).convert("RGB")) for name in batch
+            to_tensor(pad_to_square(Image.open(os.path.join(args.kaggle, name)).convert("RGB"), 0))
+            for name in batch
         ]).to(device)
         masks = (torch.sigmoid(model(images)) > 0.5).float()
         for name, image, mask in zip(batch, images, masks):
@@ -224,8 +269,8 @@ class PseudoPairs(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, index):
-        image = self.image_tf(Image.open(self.pairs[index][0]).convert("RGB"))
-        mask = self.mask_tf(Image.open(self.pairs[index][1]).convert("L"))
+        image = self.image_tf(pad_to_square(Image.open(self.pairs[index][0]).convert("RGB"), 0))
+        mask = self.mask_tf(pad_to_square(Image.open(self.pairs[index][1]).convert("L"), 0))
         if torch.rand(1).item() < 0.5:
             image, mask = TF.hflip(image), TF.hflip(mask)
         if torch.rand(1).item() < 0.5:
@@ -273,9 +318,12 @@ def main():
     data = os.path.abspath(os.path.join(here, "..", "data"))
     parser = argparse.ArgumentParser(description="ReTree pipeline: DRIVE segmenter, Kaggle pseudo labels, DDPM")
     parser.add_argument("--drive", default=os.path.join(data, "DRIVE"))
+    parser.add_argument("--stare", default=os.path.join(data, "STARE"))
+    parser.add_argument("--stare-labels", default=os.path.join(data, "labels-ah（stare的人工标注）"))
+    parser.add_argument("--segmenter-only", action="store_true",
+                        help="train the vessel segmenter and stop before pseudo labels and the DDPM")
     parser.add_argument("--kaggle", default=os.path.join(data, "kaggle", "extracted", "train"))
     parser.add_argument("--quality-csv", default=os.path.join(data, "kaggle", "Label_EyeQ_train.csv"))
-    parser.add_argument("--min-quality", type=int, default=1)
     parser.add_argument("--max-images", type=int, default=4000)
     parser.add_argument("--out", default=os.path.join(here, "results", "retree"))
     parser.add_argument("--seg-epochs", type=int, default=200)
@@ -292,6 +340,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
     segmenter = train_segmenter(args, device)
+    if args.segmenter_only:
+        print(f"segmenter only, saved to {os.path.join(args.out, 'segmenter.pth.tar')}")
+        return
     image_dir, mask_dir = write_pseudo_labels(segmenter, args, device)
     del segmenter
     torch.cuda.empty_cache()
