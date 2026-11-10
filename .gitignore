@@ -1,0 +1,32 @@
+# 数据集、权重、生成结果
+datasets/
+results/
+checkpoints/
+weights/
+runs/
+test_input/
+test_output/
+
+# 训练日志和进程文件
+*.log
+*.pid
+train.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 图片和权重不入库。README 里的方法图除外
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.pth
+*.pt
+*.ckpt
+!ddpms.jpg
