@@ -65,9 +65,11 @@ class Segmenter(nn.Module):
 
 
 class DriveSeg(Dataset):
-    def __init__(self, pairs, img_size, augment):
+    def __init__(self, pairs, img_size, augment, patches=1, patch_size=0):
         self.pairs = pairs
         self.augment = augment
+        self.patches = patches
+        self.patch_size = patch_size
         self.image_tf = transforms.Compose([
             transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
@@ -78,10 +80,10 @@ class DriveSeg(Dataset):
         ])
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.pairs) * self.patches
 
     def __getitem__(self, index):
-        image_path, vessel_path, fov_path = self.pairs[index]
+        image_path, vessel_path, fov_path = self.pairs[index % len(self.pairs)]
         image = Image.open(image_path).convert("RGB")
         vessel = Image.open(vessel_path).convert("L")
         if fov_path is not None:
@@ -99,6 +101,11 @@ class DriveSeg(Dataset):
             angle = random.uniform(-180, 180)
             image = TF.rotate(image, angle)
             vessel = TF.rotate(vessel, angle)
+        if self.patch_size and self.patch_size < image.shape[-1]:
+            top = torch.randint(0, image.shape[-2] - self.patch_size + 1, ()).item()
+            left = torch.randint(0, image.shape[-1] - self.patch_size + 1, ()).item()
+            image = image[:, top:top + self.patch_size, left:left + self.patch_size]
+            vessel = vessel[:, top:top + self.patch_size, left:left + self.patch_size]
         return image, vessel
 
 
@@ -161,13 +168,18 @@ def train_segmenter(args, device):
         f"total {len(train_pairs)} train, {len(test_pairs)} held-out"
     )
 
-    train_loader = DataLoader(
-        DriveSeg(train_pairs, args.image_size, augment=True),
-        batch_size=4, shuffle=True, num_workers=args.num_workers,
+    train_set = DriveSeg(
+        train_pairs, args.image_size, augment=True,
+        patches=args.seg_patches, patch_size=args.seg_patch_size,
     )
+    print(f"segmenter crops: {len(train_set)} patches/epoch, patch {args.seg_patch_size or args.image_size}")
+    train_loader = DataLoader(
+        train_set, batch_size=args.seg_batch_size, shuffle=True, num_workers=args.num_workers,
+    )
+    # Held-out score stays on full images, so it is comparable with the earlier runs.
     test_loader = DataLoader(
         DriveSeg(test_pairs, args.image_size, augment=False),
-        batch_size=4, shuffle=False, num_workers=args.num_workers,
+        batch_size=2, shuffle=False, num_workers=args.num_workers,
     )
 
     model = Segmenter().to(device)
@@ -330,6 +342,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=128)
+    parser.add_argument("--seg-patch-size", type=int, default=0,
+                        help="random crop size while training the segmenter; 0 uses the full image")
+    parser.add_argument("--seg-patches", type=int, default=1,
+                        help="random crops drawn from each labelled image per epoch")
+    parser.add_argument("--seg-batch-size", type=int, default=4)
     parser.add_argument("--emb-dim", type=int, default=256)
     parser.add_argument("--noise-steps", type=int, default=1000)
     parser.add_argument("--num-workers", type=int, default=4)
